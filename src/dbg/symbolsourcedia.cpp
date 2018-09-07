@@ -119,7 +119,7 @@ bool SymbolSourceDIA::loadSymbolsAsync()
     DWORD loadStart = GetTickCount();
 
     PDBDiaFile::Query_t query;
-    query.collectSize = true;
+    query.collectSize = false;
     query.collectUndecoratedNames = true;
     query.callback = [&](DiaSymbol_t & sym) -> bool
     {
@@ -245,48 +245,76 @@ bool SymbolSourceDIA::loadSourceLinesAsync()
 
     const uint32_t rangeSize = 1024 * 1024 * 10;
 
+    std::vector<DiaLineInfo_t> lines;
     std::map<DWORD, String> files;
 
-    for(duint rva = 0; rva < _imageSize; rva += rangeSize)
+    if(!pdb.enumerateLineNumbers(0, uint32_t(_imageSize), lines, files))
+        return false;
+
+    if(files.size() == 1)
+    {
+        GuiSymbolLogAdd(StringUtils::sprintf("[%p] Since there is only one file, attempting line overflow detection..\n", _imageBase).c_str());
+
+        // This is a super hack to adjust for the (undocumented) limit of 16777215 lines (unsigned 24 bits maximum).
+        // It is unclear at this point if yasm/coff/link/pdb is causing this issue.
+        // We can fix this because there is only a single source file and the returned result is sorted by *both* rva/line (IMPORTANT!).
+        // For supporting multiple source files in the future we could need multiple 'lineOverflow' variables.
+        uint32_t maxLine = 0, maxRva = 0, lineOverflows = 0;
+        for(auto & line : lines)
+        {
+            uint32_t overflowValue = 0x1000000 * (lineOverflows + 1) - 1; //0xffffff, 0x1ffffff, 0x2ffffff, etc
+            if((line.lineNumber & 0xfffff0) == 0 && (maxLine & 0xfffffff0) == (overflowValue & 0xfffffff0))  // allow 16 lines of play, perhaps there is a label/comment on line 0xffffff+1
+            {
+                GuiSymbolLogAdd(StringUtils::sprintf("[%p] Line number overflow detected (%u -> %u), adjusting with hacks...\n", _imageBase, maxLine, line.lineNumber).c_str());
+                lineOverflows++;
+            }
+
+            line.lineNumber += lineOverflows * 0xffffff + lineOverflows;
+            if(!(line.lineNumber > maxLine))
+            {
+                GuiSymbolLogAdd(StringUtils::sprintf("[%p] The line information is not sorted by line (violated assumption)! lineNumber: %u, maxLine: %u\n", _imageBase, line.lineNumber, maxLine).c_str());
+            }
+            maxLine = line.lineNumber;
+            if(!(line.rva > maxRva))
+            {
+                GuiSymbolLogAdd(StringUtils::sprintf("[%p] The line information is not sorted by rva (violated assumption)! rva: 0x%x, maxRva: 0x%x\n", _imageBase, line.rva, maxRva).c_str());
+            }
+            maxRva = line.rva;
+        }
+    }
+
+    _linesData.reserve(lines.size());
+    _sourceFiles.reserve(files.size());
+    for(const auto & line : lines)
     {
         if(_requiresShutdown)
             return false;
 
-        std::vector<DiaLineInfo_t> lines;
+        const auto & info = line;
+        auto it = _lines.find(info.rva);
+        if(it != _lines.end())
+            continue;
 
-        bool res = pdb.enumerateLineNumbers(uint32_t(rva), rangeSize, lines, files);
-        for(const auto & line : lines)
+        CachedLineInfo lineInfo;
+        lineInfo.rva = info.rva;
+        lineInfo.lineNumber = info.lineNumber;
+
+        auto sourceFileId = info.sourceFileId;
+        auto found = _sourceIdMap.find(sourceFileId);
+        if(found == _sourceIdMap.end())
         {
-            if(_requiresShutdown)
-                return false;
-
-            const auto & info = line;
-            auto it = _lines.find(info.rva);
-            if(it != _lines.end())
-                continue;
-
-            CachedLineInfo lineInfo;
-            lineInfo.rva = info.rva;
-            lineInfo.lineNumber = info.lineNumber;
-
-            auto sourceFileId = info.sourceFileId;
-            auto found = _sourceIdMap.find(sourceFileId);
-            if(found == _sourceIdMap.end())
-            {
-                auto idx = _sourceFiles.size();
-                _sourceFiles.push_back(files[sourceFileId]);
-                found = _sourceIdMap.insert({ sourceFileId, uint32_t(idx) }).first;
-            }
-            lineInfo.sourceFileIdx = found->second;
-
-            _lockLines.lock();
-
-            _linesData.push_back(lineInfo);
-            _lines.insert({ lineInfo.rva, _linesData.size() - 1 });
-
-            _lockLines.unlock();
+            auto idx = _sourceFiles.size();
+            _sourceFiles.push_back(files[sourceFileId]);
+            found = _sourceIdMap.insert({ sourceFileId, uint32_t(idx) }).first;
         }
+        lineInfo.sourceFileIdx = found->second;
 
+        _lockLines.lock();
+
+        _linesData.push_back(lineInfo);
+        _lines.insert({ lineInfo.rva, _linesData.size() - 1 });
+
+        _lockLines.unlock();
     }
 
     _sourceLines.resize(_sourceFiles.size());
